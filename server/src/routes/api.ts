@@ -69,6 +69,9 @@ router.post("/products", requireAuth, (req: Request, res: Response) => {
     purchasePrice: Number(data.purchasePrice) || 0,
     minQuantity: Number(data.minQuantity) || 0,
     supplier: data.supplier || "",
+    // Привязка к клиенту/договору
+    clientName:  data.clientName  || "",
+    contractNum: data.contractNum || "",
     description: data.description || "",
     updatedAt: new Date().toISOString(),
   };
@@ -91,20 +94,61 @@ router.delete("/products/:id", requireAuth, (req: Request, res: Response) => {
 });
 
 // ════════════════════════════════════════════════
-//  SUPPLIERS (= КЛИЕНТЫ)
+//  SUPPLIERS (= КЛИЕНТЫ) — с агрегацией из contracts/products
 // ════════════════════════════════════════════════
+
+/** Собирает агрегированные данные клиента по имени */
+function buildSupplierAggregation(name: string) {
+  const contracts = store.contracts.filter(c => c.clientName === name);
+  const products  = store.products.filter(p => (p.clientName || p.supplier) === name);
+
+  const activeContracts    = contracts.filter(c => c.status === "active");
+  const expiredContracts   = contracts.filter(c => c.status === "expired");
+  const completedContracts = contracts.filter(c => c.status === "completed");
+
+  const totalStorageCost  = contracts.reduce((s, c) => s + (c.totalStorageCost || 0), 0);
+  const totalInsurance    = contracts.reduce((s, c) => s + (c.insurancePremium || 0), 0);
+  const totalArea         = activeContracts.reduce((s, c) => s + (c.storageArea || 0), 0);
+  const totalProductQty   = products.reduce((s, p) => s + (p.quantity || 0), 0);
+
+  return {
+    contracts,
+    products,
+    stats: {
+      totalContracts:      contracts.length,
+      activeContracts:     activeContracts.length,
+      expiredContracts:    expiredContracts.length,
+      completedContracts:  completedContracts.length,
+      totalStorageCost,
+      totalInsurance,
+      totalRevenue: totalStorageCost + totalInsurance,
+      totalArea,
+      totalProductQty,
+    }
+  };
+}
+
 router.get("/suppliers", requireAuth, (req: Request, res: Response) => {
   let list = [...store.suppliers];
   const { search } = req.query;
   if (search) list = list.filter(s => s.name.toLowerCase().includes(String(search).toLowerCase()));
   list.sort((a, b) => a.name.localeCompare(b.name));
-  res.json(list);
+
+  // Добавляем агрегированную статистику к каждому клиенту
+  const enriched = list.map(s => {
+    const agg = buildSupplierAggregation(s.name);
+    return { ...s, ...agg.stats };
+  });
+
+  res.json(enriched);
 });
 
 router.get("/suppliers/:id", requireAuth, (req: Request, res: Response) => {
   const s = store.suppliers.find(s => s.id === Number(req.params.id));
   if (!s) return res.status(404).json({ error: "Клиент не найден" });
-  res.json(s);
+
+  const agg = buildSupplierAggregation(s.name);
+  res.json({ ...s, ...agg.stats, contracts: agg.contracts, products: agg.products });
 });
 
 router.post("/suppliers", requireAuth, (req: Request, res: Response) => {
@@ -121,14 +165,16 @@ router.post("/suppliers", requireAuth, (req: Request, res: Response) => {
     createdAt: new Date().toISOString(),
   };
   store.suppliers.push(supplier);
-  res.status(201).json(supplier);
+  const agg = buildSupplierAggregation(supplier.name);
+  res.status(201).json({ ...supplier, ...agg.stats });
 });
 
 router.put("/suppliers/:id", requireAuth, (req: Request, res: Response) => {
   const idx = store.suppliers.findIndex(s => s.id === Number(req.params.id));
   if (idx === -1) return res.status(404).json({ error: "Клиент не найден" });
   store.suppliers[idx] = { ...store.suppliers[idx], ...req.body, id: store.suppliers[idx].id };
-  res.json(store.suppliers[idx]);
+  const agg = buildSupplierAggregation(store.suppliers[idx].name);
+  res.json({ ...store.suppliers[idx], ...agg.stats });
 });
 
 router.delete("/suppliers/:id", requireAuth, (req: Request, res: Response) => {
@@ -197,7 +243,7 @@ router.post("/transactions", requireAuth, (req: Request, res: Response) => {
 });
 
 // ════════════════════════════════════════════════
-//  CONTRACTS (с поддержкой страхования)
+//  CONTRACTS — при создании автоматически создаёт товар
 // ════════════════════════════════════════════════
 router.get("/contracts", requireAuth, (req: Request, res: Response) => {
   let list = [...store.contracts];
@@ -236,10 +282,11 @@ router.post("/contracts", requireAuth, (req: Request, res: Response) => {
 
   const storageCostPerMonth = Number(data.storageArea) * Number(data.storageRate);
   const totalStorageCost    = storageCostPerMonth * Number(data.durationMonths);
+  const contractNumber      = `ДХ-${year}-${String(num).padStart(4, "0")}`;
 
   const contract = {
     id: store.nextId("contracts"),
-    number: `ДХ-${year}-${String(num).padStart(4, "0")}`,
+    number: contractNumber,
     status: "active" as const,
 
     clientName:        data.clientName || "",
@@ -285,24 +332,79 @@ router.post("/contracts", requireAuth, (req: Request, res: Response) => {
 
   store.contracts.push(contract);
 
-  // ── Автоматически добавляем клиента в базу клиентов (suppliers) ──────────
+  // ── Авто-регистрация клиента в справочнике ──────────────────────
   if (data.clientName) {
-    const exists = store.suppliers.find(s =>
+    const existsSupplier = store.suppliers.find(s =>
       s.name === data.clientName ||
       (data.clientPhone && s.phone === data.clientPhone) ||
       (data.clientEmail && s.email === data.clientEmail)
     );
-    if (!exists) {
+    if (!existsSupplier) {
       store.suppliers.push({
         id: store.nextId("suppliers"),
-        name: data.clientName,
-        contact: data.clientContact || "",
-        phone: data.clientPhone || "",
-        email: data.clientEmail || "",
-        address: data.clientAddress || data.clientFactAddress || "",
-        comment: `Клиент по договору ${contract.number}`,
+        name:      data.clientName,
+        contact:   data.clientContact   || "",
+        phone:     data.clientPhone     || "",
+        email:     data.clientEmail     || "",
+        address:   data.clientAddress   || data.clientFactAddress || "",
+        comment:   `Клиент по договору ${contractNumber}`,
         createdAt: new Date().toISOString(),
       });
+    } else {
+      // Обновляем контакты существующего клиента если пусты
+      const idx = store.suppliers.findIndex(s => s.name === data.clientName);
+      if (idx !== -1) {
+        const s = store.suppliers[idx];
+        store.suppliers[idx] = {
+          ...s,
+          phone:   s.phone   || data.clientPhone   || "",
+          email:   s.email   || data.clientEmail   || "",
+          contact: s.contact || data.clientContact || "",
+          address: s.address || data.clientAddress || "",
+        };
+      }
+    }
+  }
+
+  // ── Авто-регистрация товара клиента на складе ────────────────────
+  if (data.productName && data.quantity && Number(data.quantity) > 0) {
+    const sku = data.productSku || `CLT-${String(contract.id).padStart(4, "0")}`;
+
+    // Проверяем — нет ли уже такого товара этого клиента
+    const existsProd = store.products.find(p =>
+      (p.clientName === data.clientName && p.name === data.productName) ||
+      (p.sku === sku)
+    );
+
+    if (!existsProd) {
+      store.products.push({
+        id: store.nextId("products"),
+        name:         data.productName,
+        sku:          sku,
+        category:     data.productCategory || "Товары на хранении",
+        quantity:     Number(data.quantity),
+        unit:         data.unit || "шт",
+        purchasePrice: 0,          // коммерческая тайна клиента
+        minQuantity:  0,
+        supplier:     data.clientName,
+        clientName:   data.clientName,
+        contractNum:  contractNumber,
+        description:  `Принято на хранение по договору ${contractNumber}`,
+        updatedAt:    new Date().toISOString(),
+      } as any);
+    } else {
+      // Если товар уже есть — обновляем привязку к договору
+      const pIdx = store.products.findIndex(p =>
+        (p.clientName === data.clientName && p.name === data.productName) || p.sku === sku
+      );
+      if (pIdx !== -1) {
+        store.products[pIdx] = {
+          ...store.products[pIdx],
+          contractNum: contractNumber,
+          quantity: store.products[pIdx].quantity + Number(data.quantity),
+          updatedAt: new Date().toISOString(),
+        };
+      }
     }
   }
 
@@ -339,6 +441,20 @@ router.put("/contracts/:id", requireAuth, (req: Request, res: Response) => {
   }
 
   store.contracts[idx] = updated;
+
+  // Синхронизируем статус товара при завершении/отмене договора
+  if (data.status && (data.status === "completed" || data.status === "cancelled")) {
+    const pIdx = store.products.findIndex(p => p.contractNum === current.number);
+    if (pIdx !== -1) {
+      store.products[pIdx] = {
+        ...store.products[pIdx],
+        description: `Договор ${current.number} ${data.status === "completed" ? "завершён" : "отменён"}. Товар вывезен.`,
+        quantity: 0,
+        updatedAt: new Date().toISOString(),
+      };
+    }
+  }
+
   res.json(updated);
 });
 
@@ -372,7 +488,6 @@ interface PublicRequest {
   totalCost: number;
   startDate: string;
   comment: string;
-  // Страхование
   insuranceEnabled: boolean;
   declaredValue: number;
   insurancePremium: number;
@@ -383,7 +498,7 @@ interface PublicRequest {
 const publicRequests: PublicRequest[] = [];
 let nextReqId = 1;
 
-// POST /api/public-requests — принять заявку с public.html (без авторизации)
+// POST /api/public-requests
 router.post("/public-requests", (req: Request, res: Response) => {
   const {
     clientName, clientPhone, clientEmail,
@@ -417,12 +532,12 @@ router.post("/public-requests", (req: Request, res: Response) => {
   res.status(201).json({ message: "Заявка принята", id: request.id });
 });
 
-// GET /api/public-requests — список заявок для админки
+// GET /api/public-requests
 router.get("/public-requests", requireAuth, (_req: Request, res: Response) => {
   res.json([...publicRequests].reverse());
 });
 
-// PUT /api/public-requests/:id — сменить статус заявки
+// PUT /api/public-requests/:id
 router.put("/public-requests/:id", requireAuth, (req: Request, res: Response) => {
   const r = publicRequests.find(x => x.id === Number(req.params.id));
   if (!r) return res.status(404).json({ error: "Заявка не найдена" });
